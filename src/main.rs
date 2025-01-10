@@ -1,7 +1,7 @@
 use clap::Parser;
 use image::{ImageReader, RgbImage};
 use minifb::{Key, Window, WindowOptions};
-use rand::{random_range, Rng};
+use rand::{random_range};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
