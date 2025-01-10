@@ -2,7 +2,7 @@ use clap::Parser;
 use image::{ImageReader, RgbImage};
 use minifb::{Key, Window, WindowOptions};
 use rand::{random_range};
-use std::path::{Path, PathBuf};
+use std::path::{PathBuf, Path};
 
 #[derive(Parser)]
 struct Args {
@@ -35,7 +35,7 @@ fn main() {
         height as usize,
         WindowOptions::default(),
     )
-    .unwrap();
+        .unwrap();
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let mut got_improvement = false;
@@ -73,11 +73,56 @@ fn main() {
         std::fs::create_dir_all("generated_images").expect("Failed to create output directory");
 
         // Save the image
-        output_image
-            .save(&output_filename)
-            .expect("Failed to save output image");
+        output_image.save(&output_filename).expect("Failed to save output image");
         println!("Saved final image to: {}", output_filename);
     }
+}
+
+fn calculate_weighted_color(target: &Image, center_x: isize, center_y: isize, radius: isize,
+                            circle_points: &[[isize; 2]]) -> [u8; 3] {
+    // Get center color
+    let center_color = if center_x >= 0 && center_y >= 0
+        && center_x < target.width as isize && center_y < target.height as isize {
+        target.color_at([center_x as u32, center_y as u32])
+    } else {
+        [0, 0, 0]
+    };
+
+    // Calculate average edge color from valid points
+    let mut valid_points = 0;
+    let edge_color = circle_points.iter()
+        .filter(|[x, y]| {
+            x >= &0 && y >= &0 &&
+                x < &(target.width as isize) && y < &(target.height as isize)
+        })
+        .map(|[x, y]| {
+            valid_points += 1;
+            target.color_at([*x as u32, *y as u32])
+        })
+        .fold([0f32; 3], |acc, [r, g, b]| {
+            [acc[0] + r as f32, acc[1] + g as f32, acc[2] + b as f32]
+        });
+
+    if valid_points == 0 {
+        return center_color;
+    }
+
+    let edge_color = [
+        (edge_color[0] / valid_points as f32) as u8,
+        (edge_color[1] / valid_points as f32) as u8,
+        (edge_color[2] / valid_points as f32) as u8,
+    ];
+
+    // Calculate weight based on radius (larger radius = more weight to edge color)
+    let max_radius = (target.width.min(target.height) / 4) as f32;
+    let weight = (radius as f32 / max_radius).min(1.0);
+
+    // Blend colors
+    [
+        ((1.0 - weight) * center_color[0] as f32 + weight * edge_color[0] as f32) as u8,
+        ((1.0 - weight) * center_color[1] as f32 + weight * edge_color[1] as f32) as u8,
+        ((1.0 - weight) * center_color[2] as f32 + weight * edge_color[2] as f32) as u8,
+    ]
 }
 
 fn tick(target: &Image, approx: &mut Image) -> bool {
@@ -89,18 +134,22 @@ fn tick(target: &Image, approx: &mut Image) -> bool {
     let max_radius = (target.width.min(target.height) / 4) as isize;
     let radius = random_range(1..=max_radius as usize);
 
-    // Randomize color
-    let r = random_range(0..255);
-    let g = random_range(0..255);
-    let b = random_range(0..255);
+    // Generate circle points first so we can use them for both color calculation and drawing
+    let circle_points = generate_circle_points(center_x, center_y, radius as isize);
+
+    // Calculate weighted average color
+    let color = calculate_weighted_color(target, center_x, center_y, radius as isize, &circle_points);
 
     // Generate all points that would be affected by the circle
-    let changes = generate_circle_points(center_x, center_y, radius as isize)
+    let changes = circle_points
         .into_iter()
         .filter(|&[x, y]| {
-            x >= 0 && y >= 0 && x < target.width as isize && y < target.height as isize
+            x >= 0 &&
+                y >= 0 &&
+                x < target.width as isize &&
+                y < target.height as isize
         })
-        .map(|[x, y]| ([x as u32, y as u32], [r, g, b]));
+        .map(|[x, y]| ([x as u32, y as u32], color));
 
     // Check if drawing this circle would improve the approximation
     let loss_delta = Image::loss_delta(target, approx, changes.clone());
@@ -114,7 +163,6 @@ fn tick(target: &Image, approx: &mut Image) -> bool {
     true
 }
 
-// Midpoint Circle Algorithm implementation
 fn generate_circle_points(xc: isize, yc: isize, r: isize) -> Vec<[isize; 2]> {
     let mut points = Vec::new();
     let mut x = 0;
@@ -124,14 +172,10 @@ fn generate_circle_points(xc: isize, yc: isize, r: isize) -> Vec<[isize; 2]> {
     while x <= y {
         // Add points in all octants
         let octant_points = [
-            [xc + x, yc + y],
-            [xc - x, yc + y],
-            [xc + x, yc - y],
-            [xc - x, yc - y],
-            [xc + y, yc + x],
-            [xc - y, yc + x],
-            [xc + y, yc - x],
-            [xc - y, yc - x],
+            [xc + x, yc + y], [xc - x, yc + y],
+            [xc + x, yc - y], [xc - x, yc - y],
+            [xc + y, yc + x], [xc - y, yc + x],
+            [xc + y, yc - x], [xc - y, yc - x],
         ];
         points.extend_from_slice(&octant_points);
 
