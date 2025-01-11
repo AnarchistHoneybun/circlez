@@ -1,12 +1,16 @@
 use clap::Parser;
 use image::{ImageReader, RgbImage};
 use minifb::{Key, Window, WindowOptions};
-use rand::{random_range};
-use std::path::{PathBuf, Path};
+use rand::random_range;
+use std::path::{Path, PathBuf};
+use std::thread;
 
 #[derive(Parser)]
 struct Args {
     target: PathBuf,
+
+    #[clap(short, long, default_value = "1")]
+    threads: usize,
 
     #[clap(short, long, default_value = "4096")]
     iterations: usize,
@@ -25,7 +29,8 @@ fn main() {
     let width = target.width;
     let height = target.height;
 
-    let mut approx = Image::from(RgbImage::new(width, height));
+    let approx = Image::from(RgbImage::new(width, height));
+    let mut approxes = vec![approx; args.threads];
 
     let mut canvas = vec![0; (width * height) as usize];
 
@@ -35,18 +40,22 @@ fn main() {
         height as usize,
         WindowOptions::default(),
     )
-        .unwrap();
+    .unwrap();
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        let mut got_improvement = false;
+        thread::scope(|s| {
+            let mut threads = Vec::new();
 
-        for _ in 0..args.iterations {
-            got_improvement |= tick(&target, &mut approx);
-        }
+            for approx in &mut approxes {
+                threads.push(s.spawn(|| {
+                    for _ in 0..args.iterations {
+                        tick(&target, approx);
+                    }
+                }));
+            }
+        });
 
-        if got_improvement {
-            approx.encode(&mut canvas);
-        }
+        compose(&mut canvas, &target, &approxes);
 
         window
             .update_with_buffer(&canvas, width as usize, height as usize)
@@ -55,45 +64,62 @@ fn main() {
 
     // Save the final image when window closes
     if !window.is_open() || window.is_key_down(Key::Escape) {
-        // Create the output filename
         let input_path = Path::new(&args.target);
         let input_stem = input_path.file_stem().unwrap().to_str().unwrap();
         let output_filename = format!("generated_images/{}_circlez.jpg", input_stem);
 
-        // Convert the current state to an image
+        // Convert the best approximation to an image
         let mut output_image = RgbImage::new(width, height);
         for y in 0..height {
             for x in 0..width {
-                let [r, g, b] = approx.color_at([x, y]);
-                output_image.put_pixel(x, y, image::Rgb([r, g, b]));
+                let target_color = target.color_at([x, y]);
+
+                // Find the best color among all approximations
+                let best_color = approxes
+                    .iter()
+                    .map(|image| {
+                        let color = image.color_at([x, y]);
+                        let loss = Image::pixel_loss(color, target_color);
+                        (color, loss)
+                    })
+                    .min_by(|(_, a), (_, b)| a.total_cmp(b))
+                    .unwrap()
+                    .0;
+
+                output_image.put_pixel(x, y, image::Rgb(best_color));
             }
         }
 
-        // Ensure the directory exists
         std::fs::create_dir_all("generated_images").expect("Failed to create output directory");
-
-        // Save the image
-        output_image.save(&output_filename).expect("Failed to save output image");
+        output_image
+            .save(&output_filename)
+            .expect("Failed to save output image");
         println!("Saved final image to: {}", output_filename);
     }
 }
 
-fn calculate_weighted_color(target: &Image, center_x: isize, center_y: isize, radius: isize,
-                            circle_points: &[[isize; 2]]) -> [u8; 3] {
-    // Get center color
-    let center_color = if center_x >= 0 && center_y >= 0
-        && center_x < target.width as isize && center_y < target.height as isize {
+fn calculate_weighted_color(
+    target: &Image,
+    center_x: isize,
+    center_y: isize,
+    radius: isize,
+    circle_points: &[[isize; 2]],
+) -> [u8; 3] {
+    let center_color = if center_x >= 0
+        && center_y >= 0
+        && center_x < target.width as isize
+        && center_y < target.height as isize
+    {
         target.color_at([center_x as u32, center_y as u32])
     } else {
         [0, 0, 0]
     };
 
-    // Calculate average edge color from valid points
     let mut valid_points = 0;
-    let edge_color = circle_points.iter()
+    let edge_color = circle_points
+        .iter()
         .filter(|[x, y]| {
-            x >= &0 && y >= &0 &&
-                x < &(target.width as isize) && y < &(target.height as isize)
+            x >= &0 && y >= &0 && x < &(target.width as isize) && y < &(target.height as isize)
         })
         .map(|[x, y]| {
             valid_points += 1;
@@ -113,11 +139,9 @@ fn calculate_weighted_color(target: &Image, center_x: isize, center_y: isize, ra
         (edge_color[2] / valid_points as f32) as u8,
     ];
 
-    // Calculate weight based on radius (larger radius = more weight to edge color)
     let max_radius = (target.width.min(target.height) / 4) as f32;
     let weight = (radius as f32 / max_radius).min(1.0);
 
-    // Blend colors
     [
         ((1.0 - weight) * center_color[0] as f32 + weight * edge_color[0] as f32) as u8,
         ((1.0 - weight) * center_color[1] as f32 + weight * edge_color[1] as f32) as u8,
@@ -126,39 +150,29 @@ fn calculate_weighted_color(target: &Image, center_x: isize, center_y: isize, ra
 }
 
 fn tick(target: &Image, approx: &mut Image) -> bool {
-    // Randomize center point
     let center_x = random_range(0..target.width) as isize;
     let center_y = random_range(0..target.height) as isize;
 
-    // Randomize radius (limit to reasonable size based on image dimensions)
     let max_radius = (target.width.min(target.height) / 4) as isize;
     let radius = random_range(1..=max_radius as usize);
 
-    // Generate circle points first so we can use them for both color calculation and drawing
     let circle_points = generate_circle_points(center_x, center_y, radius as isize);
+    let color =
+        calculate_weighted_color(target, center_x, center_y, radius as isize, &circle_points);
 
-    // Calculate weighted average color
-    let color = calculate_weighted_color(target, center_x, center_y, radius as isize, &circle_points);
-
-    // Generate all points that would be affected by the circle
     let changes = circle_points
         .into_iter()
         .filter(|&[x, y]| {
-            x >= 0 &&
-                y >= 0 &&
-                x < target.width as isize &&
-                y < target.height as isize
+            x >= 0 && y >= 0 && x < target.width as isize && y < target.height as isize
         })
         .map(|[x, y]| ([x as u32, y as u32], color));
 
-    // Check if drawing this circle would improve the approximation
     let loss_delta = Image::loss_delta(target, approx, changes.clone());
 
     if loss_delta >= 0.0 {
         return false;
     }
 
-    // Apply the changes if the circle improves the approximation
     approx.apply(changes);
     true
 }
@@ -170,12 +184,15 @@ fn generate_circle_points(xc: isize, yc: isize, r: isize) -> Vec<[isize; 2]> {
     let mut d = 3 - 2 * r;
 
     while x <= y {
-        // Add points in all octants
         let octant_points = [
-            [xc + x, yc + y], [xc - x, yc + y],
-            [xc + x, yc - y], [xc - x, yc - y],
-            [xc + y, yc + x], [xc - y, yc + x],
-            [xc + y, yc - x], [xc - y, yc - x],
+            [xc + x, yc + y],
+            [xc - x, yc + y],
+            [xc + x, yc - y],
+            [xc - x, yc - y],
+            [xc + y, yc + x],
+            [xc - y, yc + x],
+            [xc + y, yc - x],
+            [xc - y, yc - x],
         ];
         points.extend_from_slice(&octant_points);
 
@@ -190,9 +207,31 @@ fn generate_circle_points(xc: isize, yc: isize, r: isize) -> Vec<[isize; 2]> {
     points
 }
 
-type Point = [u32; 2];
-type Color = [u8; 3];
+fn compose(canvas: &mut Vec<u32>, target: &Image, images: &[Image]) {
+    let mut buf = canvas.iter_mut();
 
+    for y in 0..target.height {
+        for x in 0..target.width {
+            let target = target.color_at([x, y]);
+
+            let winner = images
+                .iter()
+                .map(|image| {
+                    let color = image.color_at([x, y]);
+                    let loss = Image::pixel_loss(color, target);
+                    (color, loss)
+                })
+                .min_by(|(_, a), (_, b)| a.total_cmp(b))
+                .unwrap()
+                .0;
+
+            let [r, g, b] = winner;
+            *buf.next().unwrap() = u32::from_be_bytes([0, r, g, b]);
+        }
+    }
+}
+
+#[derive(Clone)]
 struct Image {
     width: u32,
     height: u32,
@@ -232,17 +271,6 @@ impl Image {
         }
     }
 
-    fn encode(&self, buf: &mut [u32]) {
-        let mut buf = buf.iter_mut();
-
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let [r, g, b] = self.color_at([x, y]);
-                *buf.next().unwrap() = u32::from_be_bytes([0, r, g, b]);
-            }
-        }
-    }
-
     fn color_at(&self, point: Point) -> Color {
         let offset = (point[1] * self.width + point[0]) as usize * 3;
         let color = &self.pixels[offset..][..3];
@@ -269,3 +297,6 @@ impl From<RgbImage> for Image {
         }
     }
 }
+
+type Point = [u32; 2];
+type Color = [u8; 3];
